@@ -9,7 +9,7 @@ from collections import deque
 from pupil_apriltags import Detector
 
 # ===================== CAMERA / NETWORK CONFIG =====================
-CAMERA_IP                  = "192.168.0.83"
+CAMERA_IP                  = "192.168.0.82"
 STREAM_URL                 = f"http://{CAMERA_IP}:81/stream"
 TAG_SIZE_M                 = 0.100           # physical AprilTag side length in metres
 APRILTAG_FAMILY            = "tagStandard41h12"
@@ -38,18 +38,24 @@ PATH_MEDIAN_KERNEL         = 9
 # remaining texture before thresholding.
 PATH_BLUR_KERNEL           = 9
 
-# --- Threshold ---
-# "otsu"     – automatic, best starting point
-# "fixed"    – use PATH_FIXED_THRESHOLD value
-# "adaptive" – local neighbourhood, helpful under uneven lighting
-PATH_THRESHOLD_MODE        = "otsu"
-PATH_FIXED_THRESHOLD       = 120
-PATH_ADAPTIVE_BLOCK_SIZE   = 31    # must be odd and > 1
-PATH_ADAPTIVE_C            = -10   # negative → keeps bright regions
+# --- Threshold / binary path mask ---
+# The path detector now uses one binary thresholding path only:
+# threshold the ROI to black/white, then process only that mask.
+# White pixels = candidate path, black pixels = background.
+PATH_BINARY_THRESHOLD      = 120
 
 # Set True when the path is DARKER than the background (black line on
 # light floor).  Inverts the binary mask so the dark path becomes white.
 PATH_INVERT_THRESHOLD      = False
+
+# Bottom selection band used to decide which white connected component
+# is the robot's current path.  Any component that touches this bottom
+# band can be selected, including paths near the left/right corners.
+PATH_MAIN_SELECTION_ROWS   = (0.82, 1.00)
+
+# Small centre preference when multiple components touch the bottom.
+# Keep this low so edge/corner paths are still accepted.
+PATH_MAIN_CENTER_BIAS      = 0.15
 
 # --- Morphology ---
 # Kernel size for open (noise removal) then close (gap filling).
@@ -155,7 +161,7 @@ class PathDetector:
                          positive → path is to the RIGHT of centre
         heading_deg    – estimated path heading (degrees from vertical,
                          positive → path leans right); None if unavailable
-        debug_frame    – annotated BGR copy of the input frame
+        debug_frame    – black/white processing view plus dashboard
     """
 
     def __init__(self):
@@ -196,26 +202,12 @@ class PathDetector:
         blurred = cv2.GaussianBlur(
             roi, (PATH_BLUR_KERNEL, PATH_BLUR_KERNEL), sigmaX=0)
 
-        # ── Step 5: threshold – isolate the bright path ────────────
-        mask = self._threshold(blurred)
+        # ── Step 5: threshold – convert the ROI to black/white ─────
+        binary_mask = self._threshold(blurred)
 
-        # ── Step 6: morphology – clean binary mask ─────────────────
-        mask = cv2.morphologyEx(
-            mask, cv2.MORPH_OPEN,  self._morph_kernel, iterations=2)
-        mask = cv2.morphologyEx(
-            mask, cv2.MORPH_CLOSE, self._morph_kernel, iterations=2)
-
-        # ── Step 6b: remove small connected components from the mask ─
-        # Wipes tiny blobs so they never appear in the overlay or
-        # affect branch detection.  Only components ≥ PATH_MIN_CONTOUR_AREA
-        # survive.
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            mask, connectivity=8)
-        clean_mask = np.zeros_like(mask)
-        for lbl in range(1, num_labels):
-            if stats[lbl, cv2.CC_STAT_AREA] >= PATH_MIN_CONTOUR_AREA:
-                clean_mask[labels == lbl] = 255
-        mask = clean_mask
+        # ── Step 6: clean the binary image and keep only the current
+        #           bottom-connected path component ──────────────────
+        mask = self._build_path_mask(binary_mask, roi_w, roi_h)
 
         # ── Step 7: find external contours ─────────────────────────
         cnts, _ = cv2.findContours(
@@ -229,7 +221,7 @@ class PathDetector:
             # not suddenly snap to zero when the path is briefly lost.
             fallback_err = self._smoothed_error if self._smoothed_error is not None else 0.0
             directions   = self._detect_branches(mask, roi_w, roi_h)
-            cam_overlay  = self._draw_camera_overlay(
+            cam_overlay  = self._draw_process_view(
                 frame, roi_y0, roi_w, roi_h, mask, None, [], [], [])
             dashboard    = self._draw_dashboard(
                 w, fallback_err, None, directions, fps=0.0)
@@ -274,7 +266,7 @@ class PathDetector:
 
         directions = self._detect_branches(mask, roi_w, roi_h)
 
-        cam_overlay = self._draw_camera_overlay(
+        cam_overlay = self._draw_process_view(
             frame, roi_y0, roi_w, roi_h,
             mask, best, secondary,
             center_pts_global, secondary_centerlines)
@@ -304,31 +296,78 @@ class PathDetector:
     # ── private helpers ────────────────────────────────────────────
 
     def _threshold(self, gray_roi: np.ndarray) -> np.ndarray:
-        mode  = PATH_THRESHOLD_MODE
         flags = cv2.THRESH_BINARY_INV if PATH_INVERT_THRESHOLD else cv2.THRESH_BINARY
-
-        if mode == "otsu":
-            _, mask = cv2.threshold(
-                gray_roi, 0, 255,
-                flags + cv2.THRESH_OTSU)
-        elif mode == "fixed":
-            _, mask = cv2.threshold(
-                gray_roi, PATH_FIXED_THRESHOLD, 255,
-                flags)
-        elif mode == "adaptive":
-            # adaptiveThreshold does not support THRESH_OTSU; invert
-            # manually when needed so all modes behave consistently.
-            adaptive_flags = (cv2.THRESH_BINARY_INV if PATH_INVERT_THRESHOLD
-                              else cv2.THRESH_BINARY)
-            mask = cv2.adaptiveThreshold(
-                gray_roi, 255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                adaptive_flags,
-                PATH_ADAPTIVE_BLOCK_SIZE,
-                PATH_ADAPTIVE_C)
-        else:
-            raise ValueError(f"Unknown PATH_THRESHOLD_MODE: {mode!r}")
+        _, mask = cv2.threshold(
+            gray_roi, PATH_BINARY_THRESHOLD, 255, flags)
         return mask
+
+    def _build_path_mask(self, binary_mask: np.ndarray,
+                         roi_w: int, roi_h: int) -> np.ndarray:
+        """
+        Starting from a black/white threshold image, keep only the white
+        component that the robot is actually standing on.
+        """
+        mask = cv2.morphologyEx(
+            binary_mask, cv2.MORPH_OPEN, self._morph_kernel, iterations=2)
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, self._morph_kernel, iterations=2)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8)
+        clean_mask = np.zeros_like(mask)
+        for lbl in range(1, num_labels):
+            if stats[lbl, cv2.CC_STAT_AREA] >= PATH_MIN_CONTOUR_AREA:
+                clean_mask[labels == lbl] = 255
+
+        return self._extract_main_path_mask(clean_mask, roi_w, roi_h)
+
+    @staticmethod
+    def _extract_main_path_mask(mask: np.ndarray,
+                                roi_w: int, roi_h: int) -> np.ndarray:
+        """
+        From the thresholded black/white mask, keep the connected white
+        component that most strongly connects to the bottom of the ROI.
+        This still works when the path runs near the left or right edge.
+        """
+        if mask.size == 0 or not np.any(mask):
+            return np.zeros_like(mask)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8)
+
+        band_r0 = int(PATH_MAIN_SELECTION_ROWS[0] * roi_h)
+        band_r1 = min(roi_h, max(band_r0 + 1,
+                                 int(PATH_MAIN_SELECTION_ROWS[1] * roi_h)))
+        bottom_band = labels[band_r0:band_r1, :]
+
+        best_label = 0
+        best_score = -1.0
+        cx_frame = roi_w / 2.0
+
+        for lbl in range(1, num_labels):
+            bottom_pixels = int(np.count_nonzero(bottom_band == lbl))
+            if bottom_pixels == 0:
+                continue
+
+            area = float(stats[lbl, cv2.CC_STAT_AREA])
+            left = float(stats[lbl, cv2.CC_STAT_LEFT])
+            width = float(stats[lbl, cv2.CC_STAT_WIDTH])
+            centroid_x = left + width / 2.0
+            centre_bonus = 1.0 - (
+                PATH_MAIN_CENTER_BIAS * abs(centroid_x - cx_frame) / max(cx_frame, 1.0)
+            )
+
+            # Prefer components with strong contact at the bottom of the
+            # image, while keeping only a gentle centre preference.
+            score = (bottom_pixels * 4.0 + area * 0.02) * centre_bonus
+            if score > best_score:
+                best_score = score
+                best_label = lbl
+
+        if best_label == 0:
+            return np.zeros_like(mask)
+
+        return np.where(labels == best_label, np.uint8(255), np.uint8(0))
 
     def _classify_contours(self, contours, roi_w: int, roi_h: int):
         """
@@ -472,58 +511,50 @@ class PathDetector:
 
     # ── visualization ─────────────────────────────────────────────
 
-    def _draw_camera_overlay(self, frame, roi_y0, roi_w, roi_h,
-                              mask, contour, secondary_contours,
-                              center_points, secondary_centerlines) -> np.ndarray:
+    def _draw_process_view(self, frame, roi_y0, roi_w, roi_h,
+                           mask, contour, secondary_contours,
+                           center_points, secondary_centerlines) -> np.ndarray:
         """
-        Minimal clean overlay on the camera frame:
-          • subtle ROI boundary
-          • green tint on detected path area
-          • secondary path outlines (cyan)
-          • primary path outline (green)
-          • secondary centerlines (yellow)
-          • primary centerline (red dots + polyline)
-        All text and numbers are kept off the camera image.
+        Render the normal camera frame, but replace only the lower ROI
+        with the processed black/white path view.
         """
         dbg = frame.copy()
-        h, w = dbg.shape[:2]
+        _, w = dbg.shape[:2]
 
-        # Subtle ROI boundary
-        cv2.line(dbg, (0, roi_y0), (w, roi_y0), (180, 140, 0), 1)
+        # ROI boundary
+        cv2.line(dbg, (0, roi_y0), (w, roi_y0), (90, 90, 90), 1)
 
-        # Semi-transparent green tint on the segmented path region
-        mask_bgr = np.zeros((roi_h, roi_w, 3), dtype=np.uint8)
-        mask_bgr[:, :, 1] = mask
-        roi_region = dbg[roi_y0:roi_y0 + roi_h, 0:roi_w]
-        cv2.addWeighted(roi_region, 0.65, mask_bgr, 0.35, 0, roi_region)
+        # Show the processed ROI directly in black and white.
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        dbg[roi_y0:roi_y0 + roi_h, 0:roi_w] = mask_bgr
 
-        # Secondary path contours – cyan, thin
+        # Secondary path contours
         for sec_cnt in (secondary_contours or []):
             shifted = sec_cnt + np.array([[[0, roi_y0]]])
-            cv2.drawContours(dbg, [shifted], -1, (200, 200, 0), 1)
+            cv2.drawContours(dbg, [shifted], -1, (180, 180, 180), 1)
 
-        # Primary path contour – bright green
+        # Primary path contour
         if contour is not None:
             shifted = contour + np.array([[[0, roi_y0]]])
-            cv2.drawContours(dbg, [shifted], -1, (0, 255, 0), 2)
+            cv2.drawContours(dbg, [shifted], -1, (255, 255, 255), 2)
 
-        # Secondary centerlines – yellow, thin
+        # Secondary centerlines
         for sec_pts in (secondary_centerlines or []):
             if not sec_pts:
                 continue
             pts = np.array(sec_pts, dtype=np.int32).reshape(-1, 1, 2)
             cv2.polylines(dbg, [pts], isClosed=False,
-                          color=(0, 210, 210), thickness=1)
+                          color=(160, 160, 160), thickness=1)
             for cx, cy in sec_pts:
-                cv2.circle(dbg, (cx, cy), 3, (0, 210, 210), -1)
+                cv2.circle(dbg, (cx, cy), 3, (160, 160, 160), -1)
 
-        # Primary centerline – red/orange dots + polyline
+        # Primary centerline
         if center_points:
             pts = np.array(center_points, dtype=np.int32).reshape(-1, 1, 2)
             cv2.polylines(dbg, [pts], isClosed=False,
-                          color=(0, 60, 255), thickness=2)
+                          color=(220, 220, 220), thickness=2)
             for cx, cy in center_points:
-                cv2.circle(dbg, (cx, cy), 4, (0, 60, 255), -1)
+                cv2.circle(dbg, (cx, cy), 4, (220, 220, 220), -1)
 
         return dbg
 
@@ -547,32 +578,12 @@ class PathDetector:
         no_path = {"forward": False, "backward": False,
                    "left": False, "right": False}
 
-        # ── Step 1: connected-component labelling ─────────────────
-        _, labels = cv2.connectedComponents(mask)
-
-        # Probe zone: a horizontal band near the bottom-centre where
-        # the robot's own path should always be visible.
-        probe_r0 = int(roi_h * 0.82)
-        probe_r1 = min(roi_h, probe_r0 + max(6, int(roi_h * 0.12)))
-        probe_c0 = int(roi_w * 0.30)
-        probe_c1 = max(probe_c0 + 1, int(roi_w * 0.70))
-
-        probe_region = labels[probe_r0:probe_r1, probe_c0:probe_c1]
-        nonzero      = probe_region[probe_region > 0]
-
-        if nonzero.size == 0:
+        # ── Step 1: isolate the bottom-centre-connected path ──────
+        main_mask = PathDetector._extract_main_path_mask(mask, roi_w, roi_h)
+        if not np.any(main_mask):
             return no_path   # robot is not on any path right now
 
-        # Most frequent label in the probe zone = main path component
-        main_label = int(np.bincount(nonzero.astype(np.intp)).argmax())
-        if main_label == 0:
-            return no_path
-
-        # ── Step 2: isolate that component ────────────────────────
-        main_mask = np.where(labels == main_label,
-                             np.uint8(255), np.uint8(0))
-
-        # ── Step 3: edge-strip checks on the connected mask ───────
+        # ── Step 2: edge-strip checks on the connected mask ───────
         def strip_hit(strip: np.ndarray) -> bool:
             if strip.size == 0:
                 return False
@@ -944,12 +955,12 @@ def main():
             })
             draw_tag_overlay(frame, corners, center, tag_id, distance_m)
 
-        # Rate-limited server send
-        if tags_list:
-            now = time.time()
-            if now - last_send_time >= min_interval:
-                send_tags_to_server(tags_list, SERVER_URL)
-                last_send_time = now
+        # Rate-limited server send.  Send every interval even when there
+        # are no detections so the other server keeps receiving updates.
+        now = time.time()
+        if now - last_send_time >= min_interval:
+            send_tags_to_server(tags_list, SERVER_URL)
+            last_send_time = now
 
         # ── FPS calculation ────────────────────────────────────────
         now = time.time()
