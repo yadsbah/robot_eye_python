@@ -17,9 +17,11 @@ CAMERA_WIDTH_PX            = 640
 CAMERA_HEIGHT_PX           = 480
 ASSUMED_HORIZONTAL_FOV_DEG = 84              # 2.8 mm lens typical FOV
 SERVER_URL                 = "http://localhost:9999"
-MAX_REQUESTS_PER_SECOND    = 3
+MAX_REQUESTS_PER_SECOND    = 10
 LINE_SENSOR_URL            = "http://localhost:3001/sensors/line"
-LINE_SENSOR_INTERVAL_MS    = 50   # send line data every N milliseconds
+LINE_SENSOR_INTERVAL_MS    = 30   # send line data every N milliseconds
+CAMERA_READ_FAILURE_LIMIT  = 15   # reconnect after this many bad reads
+CAMERA_RECONNECT_DELAY_SEC = 1.0  # short pause before reopening stream
 # ==================================================================
 
 # ===================== PATH DETECTION TUNING ======================
@@ -898,6 +900,13 @@ def draw_tag_overlay(frame, corners, center, tag_id, distance_m):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
 
+def open_camera_stream():
+    cap = cv2.VideoCapture(STREAM_URL)
+    if not cap.isOpened():
+        return None
+    return cap
+
+
 # ──────────────────────────────────────────────────────────────────
 #  MAIN LOOP
 # ──────────────────────────────────────────────────────────────────
@@ -907,8 +916,8 @@ def main():
         print("Camera configuration failed – aborting.")
         return
 
-    cap = cv2.VideoCapture(STREAM_URL)
-    if not cap.isOpened():
+    cap = open_camera_stream()
+    if cap is None:
         print("Cannot open stream.  Check STREAM_URL and network.")
         return
 
@@ -918,14 +927,38 @@ def main():
     last_line_send     = 0.0
     min_interval       = 1.0 / MAX_REQUESTS_PER_SECOND
     line_send_interval = LINE_SENSOR_INTERVAL_MS / 1000.0
+    failed_reads       = 0
 
     print("Running.  Press 'q' to quit.")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Frame read failed – retrying …")
+            failed_reads += 1
+            print(f"Frame read failed – retrying … ({failed_reads}/{CAMERA_READ_FAILURE_LIMIT})")
+
+            # Keep the OpenCV window responsive while the stream is unhealthy.
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            if failed_reads < CAMERA_READ_FAILURE_LIMIT:
+                time.sleep(0.05)
+                continue
+
+            print("Too many failed reads. Reconnecting camera stream …")
+            cap.release()
+            time.sleep(CAMERA_RECONNECT_DELAY_SEC)
+            cap = open_camera_stream()
+            failed_reads = 0
+
+            if cap is None:
+                print("Reconnect failed. Will keep trying …")
+                time.sleep(CAMERA_RECONNECT_DELAY_SEC)
+            else:
+                print("Camera stream reconnected.")
             continue
+
+        failed_reads = 0
 
         # Correct camera orientation (180° flip)
         # frame = cv2.rotate(frame, cv2.ROTATE_180)
