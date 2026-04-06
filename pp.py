@@ -87,6 +87,11 @@ PATH_MIN_ASPECT_RATIO      = 1.3
 # More lines → smoother heading estimate but negligible extra cost.
 PATH_SCANLINE_COUNT        = 20
 
+# Ignore unusually wide scanlines when computing off-center error.
+# Wide rows often happen at corners/intersections and can make the
+# midpoint look falsely close to the image centre.
+PATH_ERROR_MAX_WIDTH_RATIO = 1.35
+
 # --- Multi-path / secondary contours ---
 # Secondary contours must be at least this fraction of the primary
 # contour area to be drawn (prevents tiny noise patches appearing).
@@ -122,7 +127,7 @@ PATH_BRANCH_SIDE_ROWS  = (0.05, 0.95)
 # --- Temporal smoothing ---
 # Exponential moving average factor for the lateral error.
 # Lower → smoother but more lag.  Range 0..1.
-PATH_SMOOTHING_ALPHA       = 0.3
+PATH_SMOOTHING_ALPHA       = 0.55
 
 # --- Debug output ---
 PATH_SHOW_DEBUG            = True   # set False for headless deployment
@@ -219,15 +224,30 @@ class PathDetector:
         best, secondary = self._classify_contours(cnts, roi_w, roi_h)
 
         if best is None:
-            # Fallback: keep the last smoothed error so the robot does
-            # not suddenly snap to zero when the path is briefly lost.
+            # Fallback: still estimate the error from the filtered mask
+            # so the off-center value keeps updating even when contour
+            # classification temporarily rejects the path.
+            center_pts_roi, raw_error, heading_deg, _ = \
+                self._extract_centerline(mask, roi_w, roi_h)
+            center_pts_global = [(cx, cy + roi_y0) for cx, cy in center_pts_roi]
+
+            if center_pts_roi:
+                if self._smoothed_error is None:
+                    self._smoothed_error = raw_error
+                else:
+                    self._smoothed_error = (
+                        PATH_SMOOTHING_ALPHA * raw_error
+                        + (1.0 - PATH_SMOOTHING_ALPHA) * self._smoothed_error)
+
             fallback_err = self._smoothed_error if self._smoothed_error is not None else 0.0
             directions   = self._detect_branches(mask, roi_w, roi_h)
             cam_overlay  = self._draw_process_view(
-                frame, roi_y0, roi_w, roi_h, mask, None, [], [], [])
+                frame, roi_y0, roi_w, roi_h, mask, None, [], center_pts_global, [])
             dashboard    = self._draw_dashboard(
-                w, fallback_err, None, directions, fps=0.0)
+                w, fallback_err, heading_deg if center_pts_roi else None, directions, fps=0.0)
             result = self._empty_result(frame, mask, fallback_err)
+            result["center_points"] = center_pts_global
+            result["heading_deg"] = heading_deg if center_pts_roi else None
             result["directions"]  = directions
             result["debug_frame"] = np.vstack([cam_overlay, dashboard])
             self._maybe_save(result["debug_frame"])
@@ -477,9 +497,26 @@ class PathDetector:
         if not center_points:
             return [], 0.0, 0.0, []
 
-        # Lateral error uses the bottom-most centre point (index 0 = lowest row).
-        bottom_cx, _ = center_points[0]
-        lateral_error = float(bottom_cx - roi_w / 2.0)
+        # Lateral error should use the most trustworthy lower scanlines.
+        # Very wide rows often happen at turns/corners and make the path
+        # look more centered than it really is.
+        median_w = float(np.median(widths))
+        max_ok_w = median_w * PATH_ERROR_MAX_WIDTH_RATIO
+        reliable_points = [(pt, w) for pt, w in zip(center_points, widths)
+                           if w <= max_ok_w]
+        if not reliable_points:
+            reliable_points = list(zip(center_points, widths))
+
+        lateral_error = 0.0
+        if len(reliable_points) >= 2:
+            xs = np.array([pt[0] for pt, _ in reliable_points], dtype=np.float32)
+            ys = np.array([pt[1] for pt, _ in reliable_points], dtype=np.float32)
+            coeffs = np.polyfit(ys, xs, 1)
+            bottom_est_x = float(np.polyval(coeffs, roi_h - 1))
+            lateral_error = bottom_est_x - roi_w / 2.0
+        else:
+            bottom_cx, _ = reliable_points[0][0]
+            lateral_error = float(bottom_cx - roi_w / 2.0)
 
         # Fit a line through all centre points to estimate heading.
         heading_deg = 0.0
@@ -495,7 +532,6 @@ class PathDetector:
         # wider than the median width are likely branch or crossing points.
         intersection_pts = []
         if widths:
-            median_w = float(np.median(widths))
             threshold = median_w * PATH_INTERSECTION_WIDTH_RATIO
             for (pt, w) in zip(center_points, widths):
                 if w > threshold:
@@ -679,10 +715,11 @@ class PathDetector:
                    9, (0, 0, 0), 1)
 
         # Value text
+        norm_error = lateral_error / MAX_ERR if MAX_ERR > 0 else 0.0
         direction_txt = "RIGHT" if lateral_error > 1 else ("LEFT" if lateral_error < -1 else "CENTER")
         val_colour    = (0, 200, 80) if abs(lateral_error) < 15 else (0, 100, 255)
         cv2.putText(panel,
-                    f"{lateral_error:+.1f} px  {direction_txt}",
+                    f"{lateral_error:+.1f} px  norm {norm_error:+.3f}  {direction_txt}",
                     (BAR_X0, BAR_Y1 + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_colour, 1)
 
