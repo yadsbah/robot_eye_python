@@ -5,6 +5,7 @@ import time
 import requests
 import json
 import os
+import websocket
 from collections import deque
 from pupil_apriltags import Detector
 
@@ -19,6 +20,7 @@ ASSUMED_HORIZONTAL_FOV_DEG = 84              # 2.8 mm lens typical FOV
 SERVER_URL                 = "http://localhost:9999"
 MAX_REQUESTS_PER_SECOND    = 10
 LINE_SENSOR_URL            = "http://localhost:3001/sensors/line"
+LINE_SENSOR_WS_URL         = "ws://localhost:3002"
 LINE_SENSOR_INTERVAL_MS    = 20   # send line data every N milliseconds
 CAMERA_READ_FAILURE_LIMIT  = 15   # reconnect after this many bad reads
 CAMERA_RECONNECT_DELAY_SEC = 1.0  # short pause before reopening stream
@@ -861,8 +863,28 @@ def send_tags_to_server(tags_data, server_url):
         return False
 
 
+_line_ws = None
+
+
+def _get_line_ws():
+    """Return a connected WebSocket, reconnecting if necessary."""
+    global _line_ws
+    if _line_ws is not None and _line_ws.connected:
+        return _line_ws
+    try:
+        _line_ws = websocket.WebSocket()
+        _line_ws.connect(LINE_SENSOR_WS_URL, timeout=2)
+        _line_ws.settimeout(0.05)
+        print(f"[WS] Connected to {LINE_SENSOR_WS_URL}")
+    except Exception as e:
+        print(f"[WS] Connection failed: {e}")
+        _line_ws = None
+    return _line_ws
+
+
 def send_line_data(path_result, frame_w, frame_h):
-    """Post line-sensor data to LINE_SENSOR_URL (non-blocking, fire-and-forget)."""
+    """Send line-sensor data over a persistent WebSocket (fire-and-forget)."""
+    global _line_ws
     directions  = path_result["directions"]
     lat_err     = path_result["lateral_error"]
     heading     = path_result["heading_deg"]
@@ -886,10 +908,14 @@ def send_line_data(path_result, frame_w, frame_h):
         "frame_height": frame_h,
         "timestamp":    time.time(),
     }
+
+    ws = _get_line_ws()
+    if ws is None:
+        return
     try:
-        requests.post(LINE_SENSOR_URL, json=payload, timeout=0.08)
-    except requests.exceptions.RequestException:
-        pass
+        ws.send(json.dumps(payload))
+    except Exception:
+        _line_ws = None
 
 
 def configure_camera():
