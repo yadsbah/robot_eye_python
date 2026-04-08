@@ -19,7 +19,7 @@ ASSUMED_HORIZONTAL_FOV_DEG = 84              # 2.8 mm lens typical FOV
 SERVER_URL                 = "http://localhost:9999"
 MAX_REQUESTS_PER_SECOND    = 10
 LINE_SENSOR_URL            = "http://localhost:3001/sensors/line"
-LINE_SENSOR_INTERVAL_MS    = 30   # send line data every N milliseconds
+LINE_SENSOR_INTERVAL_MS    = 20   # send line data every N milliseconds
 CAMERA_READ_FAILURE_LIMIT  = 15   # reconnect after this many bad reads
 CAMERA_RECONNECT_DELAY_SEC = 1.0  # short pause before reopening stream
 # ==================================================================
@@ -127,7 +127,7 @@ PATH_BRANCH_SIDE_ROWS  = (0.05, 0.95)
 # --- Temporal smoothing ---
 # Exponential moving average factor for the lateral error.
 # Lower → smoother but more lag.  Range 0..1.
-PATH_SMOOTHING_ALPHA       = 0.55
+PATH_SMOOTHING_ALPHA       = 0.75
 
 # --- Debug output ---
 PATH_SHOW_DEBUG            = True   # set False for headless deployment
@@ -895,7 +895,7 @@ def send_line_data(path_result, frame_w, frame_h):
 def configure_camera():
     """Push settings to ESP32-CAM before the stream starts."""
     config_urls = [
-         f"http://{CAMERA_IP}/control?var=framesize&val=10",
+         f"http://{CAMERA_IP}/control?var=framesize&val=9",
          f"http://{CAMERA_IP}/control?var=quality&val=20",
          f"http://{CAMERA_IP}/control?var=brightness&val=-2",
         f"http://{CAMERA_IP}/control?var=awb_gain&val=1",
