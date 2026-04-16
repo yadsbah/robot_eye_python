@@ -7,19 +7,10 @@ import json
 import os
 import websocket
 from collections import deque
-from pupil_apriltags import Detector
 
 # ===================== CAMERA / NETWORK CONFIG =====================
 CAMERA_IP                  = "192.168.0.82"
 STREAM_URL                 = f"http://{CAMERA_IP}:81/stream"
-TAG_SIZE_M                 = 0.100           # physical AprilTag side length in metres
-APRILTAG_FAMILY            = "tagStandard41h12"
-CAMERA_WIDTH_PX            = 640
-CAMERA_HEIGHT_PX           = 480
-ASSUMED_HORIZONTAL_FOV_DEG = 84              # 2.8 mm lens typical FOV
-SERVER_URL                 = "http://localhost:9999"
-MAX_REQUESTS_PER_SECOND    = 10
-LINE_SENSOR_URL            = "http://localhost:3001/sensors/line"
 LINE_SENSOR_WS_URL         = "ws://localhost:3002"
 LINE_SENSOR_INTERVAL_MS    = 20   # send line data every N milliseconds
 CAMERA_READ_FAILURE_LIMIT  = 15   # reconnect after this many bad reads
@@ -821,48 +812,6 @@ class PathDetector:
         }
 
 
-# ──────────────────────────────────────────────────────────────────
-#  APRILTAG HELPERS  (unchanged from original)
-# ──────────────────────────────────────────────────────────────────
-
-detector = Detector(families=APRILTAG_FAMILY)
-
-
-def approx_focal_from_fov(frame_width_px, fov_deg):
-    fov_rad = math.radians(fov_deg)
-    return (frame_width_px / 2.0) / math.tan(fov_rad / 2.0)
-
-
-def estimate_distance_pixel(corner_pts, frame_width_px,
-                             assumed_fov_deg, tag_size_m):
-    p0, p1, p2, p3 = corner_pts
-    top_w  = np.linalg.norm(p1 - p0)
-    bot_w  = np.linalg.norm(p2 - p3)
-    tag_px = (top_w + bot_w) / 2.0
-    if tag_px < 1e-6:
-        return None
-    fx = approx_focal_from_fov(frame_width_px, assumed_fov_deg)
-    return (tag_size_m * fx) / tag_px
-
-
-def calculate_tag_size_pixels(corners):
-    p0, p1, p2, p3 = corners
-    width  = (np.linalg.norm(p1 - p0) + np.linalg.norm(p2 - p3)) / 2.0
-    height = (np.linalg.norm(p3 - p0) + np.linalg.norm(p2 - p1)) / 2.0
-    return width, height
-
-
-def send_tags_to_server(tags_data, server_url):
-    try:
-        response = requests.post(server_url, json=tags_data, timeout=0.1)
-        if response.status_code != 200:
-            print(f"Server error: {response.status_code}")
-            return False
-        return True
-    except requests.exceptions.RequestException:
-        return False
-
-
 _line_ws = None
 
 
@@ -952,17 +901,6 @@ def configure_camera():
     return True
 
 
-def draw_tag_overlay(frame, corners, center, tag_id, distance_m):
-    corners_i = np.int32(corners)
-    cv2.polylines(frame, [corners_i], isClosed=True,
-                  color=(0, 255, 0), thickness=2)
-    cv2.circle(frame, tuple(np.int32(center)), 4, (0, 0, 255), -1)
-    txt = f"ID:{tag_id}  {distance_m * 100:.1f} cm"
-    cv2.putText(frame, txt,
-                (int(center[0] + 10), int(center[1] - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-
 def open_camera_stream():
     cap = cv2.VideoCapture(STREAM_URL)
     if not cap.isOpened():
@@ -986,9 +924,7 @@ def main():
 
     path_detector      = PathDetector()
     prev_time          = time.time()
-    last_send_time     = 0.0
     last_line_send     = 0.0
-    min_interval       = 1.0 / MAX_REQUESTS_PER_SECOND
     line_send_interval = LINE_SENSOR_INTERVAL_MS / 1000.0
     failed_reads       = 0
 
@@ -1026,37 +962,6 @@ def main():
         # Correct camera orientation (180° flip)
         # frame = cv2.rotate(frame, cv2.ROTATE_180)
         canvas_h, canvas_w = frame.shape[:2]
-
-        # ── AprilTag detection ─────────────────────────────────────
-        gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detections = detector.detect(gray)
-
-        tags_list = []
-        for det in detections:
-            corners    = np.array(det.corners, dtype=np.float32)
-            center     = np.mean(corners, axis=0)
-            tag_id     = det.tag_id
-            distance_m = estimate_distance_pixel(
-                corners, CAMERA_WIDTH_PX,
-                ASSUMED_HORIZONTAL_FOV_DEG, TAG_SIZE_M) or 0.0
-
-            tag_w, tag_h = calculate_tag_size_pixels(corners)
-
-            tags_list.append({
-                "tag_id":      int(tag_id),
-                "center":      {"x": float(center[0]), "y": float(center[1])},
-                "tag_size":    float((tag_w + tag_h) / 2.0),
-                "canvas_size": {"width": canvas_w, "height": canvas_h},
-                "distance":    float(distance_m),
-            })
-            draw_tag_overlay(frame, corners, center, tag_id, distance_m)
-
-        # Rate-limited server send.  Send every interval even when there
-        # are no detections so the other server keeps receiving updates.
-        now = time.time()
-        if now - last_send_time >= min_interval:
-            send_tags_to_server(tags_list, SERVER_URL)
-            last_send_time = now
 
         # ── FPS calculation ────────────────────────────────────────
         now = time.time()
