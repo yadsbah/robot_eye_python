@@ -31,7 +31,7 @@ CAMERA_RECONNECT_DELAY_SEC = 1.0  # short pause before reopening stream
 # Fraction of frame height from the TOP where the floor ROI starts.
 # 0.5 = bottom half; 0.4 = bottom 60 %.  Start here, adjust if the
 # path is cut off or too much non-floor content is included.
-PATH_ROI_TOP_FRACTION      = 0.80
+PATH_ROI_TOP_FRACTION      = 0.77
 
 # --- Blur ---
 # Median kernel (must be odd).  Applied FIRST to kill salt-and-pepper
@@ -921,7 +921,7 @@ def send_line_data(path_result, frame_w, frame_h):
 def configure_camera():
     """Push settings to ESP32-CAM before the stream starts."""
     config_urls = [
-         f"http://{CAMERA_IP}/control?var=framesize&val=9",
+         f"http://{CAMERA_IP}/control?var=framesize&val=10",
          f"http://{CAMERA_IP}/control?var=quality&val=20",
          f"http://{CAMERA_IP}/control?var=brightness&val=-2",
         f"http://{CAMERA_IP}/control?var=awb_gain&val=1",
