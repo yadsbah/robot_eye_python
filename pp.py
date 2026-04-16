@@ -7,6 +7,9 @@ import json
 import os
 import websocket
 from collections import deque
+from typing import List, Tuple
+
+from pupil_apriltags import Detector
 
 # ===================== CAMERA / NETWORK CONFIG =====================
 CAMERA_IP                  = "192.168.0.82"
@@ -16,6 +19,104 @@ LINE_SENSOR_INTERVAL_MS    = 20   # send line data every N milliseconds
 CAMERA_READ_FAILURE_LIMIT  = 15   # reconnect after this many bad reads
 CAMERA_RECONNECT_DELAY_SEC = 1.0  # short pause before reopening stream
 # ==================================================================
+
+# ===================== APRILTAG DETECTION CONFIG ====================
+APRILTAG_ENABLE = True
+TAG_SIZE_M = 0.100  # physical AprilTag side length in metres
+APRILTAG_FAMILY = "tagStandard41h12"
+ASSUMED_HORIZONTAL_FOV_DEG = 84  # 2.8 mm lens typical FOV
+
+# If you’re not sure which family your printed tag is, you can cycle these at runtime (press "f").
+FALLBACK_FAMILIES: List[str] = [
+    APRILTAG_FAMILY,
+    "tag36h11",
+    "tag25h9",
+    "tag16h5",
+    "tagCircle21h7",
+    "tagCircle49h12",
+    "tagStandard52h13",
+    "tagCustom48h12",
+]
+# Path-finding view vertical flip (top↔bottom). AprilTag detection always runs on the unflipped frame.
+# Press "v" at runtime to toggle this path/display flip.
+PATH_VERTICAL_FLIP = True
+# ====================================================================
+
+
+def intrinsics_from_horizontal_fov(
+    width_px: int, height_px: int, hfov_deg: float
+) -> Tuple[float, float, float, float]:
+    cx = width_px * 0.5
+    cy = height_px * 0.5
+    hfov_rad = math.radians(hfov_deg)
+    fx = (width_px * 0.5) / math.tan(hfov_rad * 0.5)
+    fy = fx
+    return (fx, fy, cx, cy)
+
+
+def draw_apriltag_detections(
+    bgr: np.ndarray,
+    detections,
+    camera_params: Tuple[float, float, float, float],
+    tag_size_m: float,
+    *,
+    flip_y: bool = False,
+) -> None:
+    fx, fy, cx, cy = camera_params
+    cam_mat = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    dist = np.zeros(5, dtype=np.float64)
+    axis_len = tag_size_m * 0.5
+    h = int(bgr.shape[0])
+
+    for det in detections:
+        tid = int(det.tag_id)
+        corners = np.array(det.corners, dtype=np.float32).reshape(-1, 1, 2)
+        if flip_y:
+            corners[:, 0, 1] = (h - 1) - corners[:, 0, 1]
+        cv2.polylines(bgr, [corners.astype(np.int32)], True, (0, 255, 0), 2)
+
+        c = det.center
+        cy_px = int((h - 1) - c[1]) if flip_y else int(c[1])
+        cv2.circle(bgr, (int(c[0]), cy_px), 4, (0, 0, 255), -1)
+        label = f"id={tid} margin={det.decision_margin:.1f}"
+        cv2.putText(
+            bgr,
+            label,
+            (int(corners[0, 0, 0]), int(corners[0, 0, 1]) - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+        # Pose axes are only correct when drawing in the same (unflipped) image geometry
+        # used for pose estimation.
+        if (
+            (not flip_y)
+            and getattr(det, "pose_R", None) is not None
+            and getattr(det, "pose_t", None) is not None
+        ):
+            rvec, _ = cv2.Rodrigues(np.array(det.pose_R, dtype=np.float64))
+            tvec = np.array(det.pose_t, dtype=np.float64).reshape(3, 1)
+            try:
+                cv2.drawFrameAxes(bgr, cam_mat, dist, rvec, tvec, axis_len)
+            except AttributeError:
+                obj = np.array(
+                    [
+                        [0.0, 0.0, 0.0],
+                        [axis_len, 0.0, 0.0],
+                        [0.0, axis_len, 0.0],
+                        [0.0, 0.0, axis_len],
+                    ],
+                    dtype=np.float64,
+                )
+                imgpts, _ = cv2.projectPoints(obj, rvec, tvec, cam_mat, dist)
+                imgpts = imgpts.reshape(-1, 2).astype(np.int32)
+                origin = tuple(imgpts[0])
+                cv2.line(bgr, origin, tuple(imgpts[1]), (0, 0, 255), 2)
+                cv2.line(bgr, origin, tuple(imgpts[2]), (0, 255, 0), 2)
+                cv2.line(bgr, origin, tuple(imgpts[3]), (255, 0, 0), 2)
 
 # ===================== PATH DETECTION TUNING ======================
 # --- ROI ---
@@ -831,7 +932,7 @@ def _get_line_ws():
     return _line_ws
 
 
-def send_line_data(path_result, frame_w, frame_h):
+def send_line_data(path_result, frame_w, frame_h, apriltags=None, fps=None):
     """Send line-sensor data over a persistent WebSocket (fire-and-forget)."""
     global _line_ws
     directions  = path_result["directions"]
@@ -853,8 +954,10 @@ def send_line_data(path_result, frame_w, frame_h):
             "left":     directions["left"],
             "right":    directions["right"],
         },
+        "apriltags": apriltags or [],
         "frame_width":  frame_w,
         "frame_height": frame_h,
+        "fps":          round(float(fps), 2) if fps is not None else None,
         "timestamp":    time.time(),
     }
 
@@ -878,14 +981,11 @@ def configure_camera():
         f"http://{CAMERA_IP}/control?var=aec&val=1",
         f"http://{CAMERA_IP}/control?var=wpc&val=0",
         f"http://{CAMERA_IP}/control?var=lenc&val=0",
-        f"http://{CAMERA_IP}/control?var=vflip&val=1",
+        # Keep camera output unflipped; we do a software flip only for the path pipeline.
+        f"http://{CAMERA_IP}/control?var=vflip&val=0",
         f"http://{CAMERA_IP}/control?var=special_effect&val=2",
 
-        # f"http://{CAMERA_IP}/control?var=awb&val=0",
-        # f"http://{CAMERA_IP}/control?var=agc&val=0",
-        # f"http://{CAMERA_IP}/control?var=raw_gma&val=0",
-        # f"http://{CAMERA_IP}/control?var=agc_gain&val=10",
-        # f"http://{CAMERA_IP}/control?var=aec_value&val=429",
+
     ]
     print("Configuring camera …")
     for url in config_urls:
@@ -927,8 +1027,24 @@ def main():
     last_line_send     = 0.0
     line_send_interval = LINE_SENSOR_INTERVAL_MS / 1000.0
     failed_reads       = 0
+    path_vflip         = PATH_VERTICAL_FLIP
 
-    print("Running.  Press 'q' to quit.")
+    family_idx = 0
+
+    def make_detector(family: str) -> Detector:
+        return Detector(
+            families=family,
+            nthreads=2,
+            quad_decimate=1.0,
+            quad_sigma=0.0,
+            refine_edges=1,
+            decode_sharpening=0.25,
+            debug=0,
+        )
+
+    detector = make_detector(FALLBACK_FAMILIES[family_idx])
+
+    print("Running.  Press 'q' to quit. Press 'f' to cycle AprilTag families. Press 'v' to toggle path vertical flip.")
 
     while True:
         ret, frame = cap.read()
@@ -959,9 +1075,12 @@ def main():
 
         failed_reads = 0
 
-        # Correct camera orientation (180° flip)
-        # frame = cv2.rotate(frame, cv2.ROTATE_180)
-        canvas_h, canvas_w = frame.shape[:2]
+        # Keep the raw frame for AprilTag detection.
+        raw_frame = frame
+
+        # Path-finding/display frame (optionally vertically flipped).
+        path_frame = cv2.flip(raw_frame, 0) if path_vflip else raw_frame
+        canvas_h, canvas_w = path_frame.shape[:2]
 
         # ── FPS calculation ────────────────────────────────────────
         now = time.time()
@@ -969,13 +1088,12 @@ def main():
         prev_time = now
 
         # ── Path detection ─────────────────────────────────────────
-        path_result = path_detector.detect_path(frame)
+        path_result = path_detector.detect_path(path_frame)
 
-        # ── Send line sensor data every LINE_SENSOR_INTERVAL_MS ────
+        apriltags_payload = []
+        # Decide whether we should send this frame's data.
         now = time.time()
-        if now - last_line_send >= line_send_interval:
-            send_line_data(path_result, canvas_w, canvas_h)
-            last_line_send = now
+        should_send = (now - last_line_send) >= line_send_interval
 
         # Rebuild the dashboard with real FPS (detect_path uses 0.0 as placeholder).
         cam_h    = frame.shape[0]
@@ -988,11 +1106,84 @@ def main():
             fps)
         display[cam_h:, :] = new_dash
 
+        # ── AprilTag detection overlay (drawn on the camera portion only) ──
+        if APRILTAG_ENABLE:
+            camera_params = intrinsics_from_horizontal_fov(
+                canvas_w, canvas_h, ASSUMED_HORIZONTAL_FOV_DEG
+            )
+            # Detect on the *unflipped* frame for correct tag decoding.
+            gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+
+            # Try both polarities; pick the better result.
+            dets_a = detector.detect(
+                gray,
+                estimate_tag_pose=True,
+                camera_params=camera_params,
+                tag_size=TAG_SIZE_M,
+            )
+            dets_b = detector.detect(
+                255 - gray,
+                estimate_tag_pose=True,
+                camera_params=camera_params,
+                tag_size=TAG_SIZE_M,
+            )
+            dets = dets_b if len(dets_b) > len(dets_a) else dets_a
+
+            # Build JSON-friendly payload for WS.
+            h = int(canvas_h)
+            for det in dets:
+                cx, cy = float(det.center[0]), float(det.center[1])
+                disp_cy = float((h - 1) - cy) if path_vflip else cy
+
+                pose_t = getattr(det, "pose_t", None)
+                if pose_t is not None:
+                    t = np.array(pose_t, dtype=np.float64).reshape(3)
+                    distance_m = float(np.linalg.norm(t))
+                    z_m = float(t[2])
+                    xyz_m = (float(t[0]), float(t[1]), float(t[2]))
+                else:
+                    distance_m = None
+                    z_m = None
+                    xyz_m = None
+
+                apriltags_payload.append(
+                    {
+                        "id": int(det.tag_id),
+                        "margin": float(det.decision_margin),
+                        "center_px": [round(cx, 1), round(cy, 1)],
+                        "center_display_px": [round(cx, 1), round(disp_cy, 1)],
+                        "distance_m": round(distance_m, 4) if distance_m is not None else None,
+                        "z_m": round(z_m, 4) if z_m is not None else None,
+                        "tvec_m": [round(x, 4) for x in xyz_m] if xyz_m is not None else None,
+                    }
+                )
+
+            draw_apriltag_detections(
+                display[:cam_h, :],
+                dets,
+                camera_params,
+                TAG_SIZE_M,
+                flip_y=path_vflip,
+            )
+
+        # ── Send line sensor + AprilTag data every LINE_SENSOR_INTERVAL_MS ────
+        if should_send:
+            send_line_data(path_result, canvas_w, canvas_h, apriltags=apriltags_payload, fps=fps)
+            last_line_send = now
+
         # ── Display ────────────────────────────────────────────────
         cv2.imshow("Robot Navigation", display)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        if key in (ord("f"), ord("F")):
+            family_idx = (family_idx + 1) % len(FALLBACK_FAMILIES)
+            detector = make_detector(FALLBACK_FAMILIES[family_idx])
+            print(f"AprilTag family: {FALLBACK_FAMILIES[family_idx]}")
+        if key in (ord("v"), ord("V")):
+            path_vflip = not path_vflip
+            print(f"Path vertical flip: {int(path_vflip)}")
 
     cap.release()
     cv2.destroyAllWindows()
